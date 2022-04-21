@@ -1,4 +1,5 @@
-//+build windows
+//go:build windows
+// +build windows
 
 // Package etw allows you to receive Event Tracing for Windows (ETW) events.
 //
@@ -51,9 +52,9 @@ func (e ExistsError) Error() string {
 // Session should be closed via `.Close` call to free obtained OS resources
 // even if `.Process` has never been called.
 type Session struct {
-	guid     windows.GUID
-	config   SessionOptions
-	callback EventCallback
+	providers map[windows.GUID]*Provider
+	config    SessionOptions
+	callback  EventCallback
 
 	etwSessionName []uint16
 	hSession       C.TRACEHANDLE
@@ -80,18 +81,18 @@ type EventCallback func(e *Event)
 //
 // You MUST call `.Close` on session after use to clear associated resources,
 // otherwise it will leak in OS internals until system reboot.
-func NewSession(providerGUID windows.GUID, options ...Option) (*Session, error) {
+func NewSession(options ...Option) (*Session, error) {
 	defaultConfig := SessionOptions{
-		Name:  "go-etw-" + randomName(),
-		Level: TRACE_LEVEL_VERBOSE,
+		Name: "go-etw-" + randomName(),
 	}
 	for _, opt := range options {
 		opt(&defaultConfig)
 	}
 	s := Session{
-		guid:   providerGUID,
 		config: defaultConfig,
 	}
+
+	s.providers = make(map[windows.GUID]*Provider, 10)
 
 	utf16Name, err := windows.UTF16FromString(s.config.Name)
 	if err != nil {
@@ -107,6 +108,26 @@ func NewSession(providerGUID windows.GUID, options ...Option) (*Session, error) 
 	return &s, nil
 }
 
+// Add or update a provider to the trace session
+// If the provider does not already exist in the trace session it will be added
+// Otherwise it will be updated
+func (s *Session) AddOrUpdateProvider(provider *Provider) error {
+	// Add the provider to the internal session object
+	s.providers[provider.ProviderId] = provider
+
+	// Actually add it to the trace
+	return s.subscribeToProvider(provider)
+}
+
+// Remove a provider from the trace session
+func (s *Session) RemoveProvider(provider *Provider) error {
+	// Delete the provider from the internal session object
+	delete(s.providers, provider.ProviderId)
+
+	// Actually remove it from the trace
+	return s.unsubscribeFromProvider(provider)
+}
+
 // Process starts processing of ETW events. Events will be passed to @cb
 // synchronously and sequentially. Take a look to EventCallback documentation
 // for more info about events processing.
@@ -114,10 +135,6 @@ func NewSession(providerGUID windows.GUID, options ...Option) (*Session, error) 
 // N.B. Process blocks until `.Close` being called!
 func (s *Session) Process(cb EventCallback) error {
 	s.callback = cb
-
-	if err := s.subscribeToProvider(); err != nil {
-		return fmt.Errorf("failed to subscribe to provider; %w", err)
-	}
 
 	cgoKey := newCallbackKey(s)
 	defer freeCallbackKey(cgoKey)
@@ -129,31 +146,22 @@ func (s *Session) Process(cb EventCallback) error {
 	return nil
 }
 
-// UpdateOptions changes subscription parameters in runtime. The only option
-// that can't be updated is session name. To change session name -- stop and
-// recreate a session with new desired name.
-func (s *Session) UpdateOptions(options ...Option) error {
-	for _, opt := range options {
-		opt(&s.config)
-	}
-	if err := s.subscribeToProvider(); err != nil {
-		return err
-	}
-	return nil
-}
-
 // Close stops trace session and frees associated resources.
 func (s *Session) Close() error {
+	var result error
+
 	// "Be sure to disable all providers before stopping the session."
 	// https://docs.microsoft.com/en-us/windows/win32/etw/configuring-and-starting-an-event-tracing-session
-	if err := s.unsubscribeFromProvider(); err != nil {
-		return fmt.Errorf("failed to disable provider; %w", err)
+	for _, provider := range s.providers {
+		if err := s.unsubscribeFromProvider(provider); err != nil {
+			result = err
+		}
 	}
 
 	if err := s.stopSession(); err != nil {
 		return fmt.Errorf("failed to stop session; %w", err)
 	}
-	return nil
+	return result
 }
 
 // KillSession forces the session with a given @name to stop. Don't having a
@@ -248,12 +256,12 @@ func (s *Session) createETWSession() error {
 }
 
 // subscribeToProvider wraps EnableTraceEx2 with EVENT_CONTROL_CODE_ENABLE_PROVIDER.
-func (s *Session) subscribeToProvider() error {
+func (s *Session) subscribeToProvider(provider *Provider) error {
 	// https://docs.microsoft.com/en-us/windows/win32/etw/configuring-and-starting-an-event-tracing-session
 	params := C.ENABLE_TRACE_PARAMETERS{
 		Version: 2, // ENABLE_TRACE_PARAMETERS_VERSION_2
 	}
-	for _, p := range s.config.EnableProperties {
+	for _, p := range provider.EnableProperties {
 		params.EnableProperty |= C.ULONG(p)
 	}
 
@@ -271,11 +279,11 @@ func (s *Session) subscribeToProvider() error {
 	// Ref: https://docs.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-enabletraceex2
 	ret := C.EnableTraceEx2(
 		s.hSession,
-		(*C.GUID)(unsafe.Pointer(&s.guid)),
+		(*C.GUID)(unsafe.Pointer(&provider.ProviderId)),
 		C.EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-		C.UCHAR(s.config.Level),
-		C.ULONGLONG(s.config.MatchAnyKeyword),
-		C.ULONGLONG(s.config.MatchAllKeyword),
+		C.UCHAR(provider.Level),
+		C.ULONGLONG(provider.MatchAnyKeyword),
+		C.ULONGLONG(provider.MatchAllKeyword),
 		0,       // Timeout set to zero to enable the trace asynchronously
 		&params, //nolint:gocritic // TODO: dupSubExpr?? gocritic bug?
 	)
@@ -283,11 +291,12 @@ func (s *Session) subscribeToProvider() error {
 	if status := windows.Errno(ret); status != windows.ERROR_SUCCESS {
 		return fmt.Errorf("EVENT_CONTROL_CODE_ENABLE_PROVIDER failed; %w", status)
 	}
+
 	return nil
 }
 
 // unsubscribeFromProvider wraps EnableTraceEx2 with EVENT_CONTROL_CODE_DISABLE_PROVIDER.
-func (s *Session) unsubscribeFromProvider() error {
+func (s *Session) unsubscribeFromProvider(provider *Provider) error {
 	// ULONG WMIAPI EnableTraceEx2(
 	//	TRACEHANDLE              TraceHandle,
 	//	LPCGUID                  ProviderId,
@@ -300,7 +309,7 @@ func (s *Session) unsubscribeFromProvider() error {
 	// );
 	ret := C.EnableTraceEx2(
 		s.hSession,
-		(*C.GUID)(unsafe.Pointer(&s.guid)),
+		(*C.GUID)(unsafe.Pointer(&provider.ProviderId)),
 		C.EVENT_CONTROL_CODE_DISABLE_PROVIDER,
 		0,
 		0,
