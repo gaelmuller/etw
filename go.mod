@@ -1,4 +1,4 @@
-module github.com/Velocidex/etw
+module github.com/gaelmuller/etw
 
 go 1.13
 

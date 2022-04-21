@@ -14,7 +14,7 @@ import (
 	"github.com/stretchr/testify/suite"
 	"golang.org/x/sys/windows"
 
-	"github.com/Velocidex/etw"
+	"github.com/gaelmuller/etw"
 )
 
 func TestSession(t *testing.T) {

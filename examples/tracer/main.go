@@ -1,4 +1,5 @@
-//+build windows
+//go:build windows
+// +build windows
 
 package main
 
@@ -14,7 +15,7 @@ import (
 
 	"golang.org/x/sys/windows"
 
-	"github.com/Velocidex/etw"
+	"github.com/gaelmuller/etw"
 )
 
 func main() {
