@@ -57,6 +57,7 @@ type Session struct {
 	callback  EventCallback
 
 	etwSessionName []uint16
+	hRegistration  C.TRACEHANDLE
 	hSession       C.TRACEHANDLE
 	propertiesBuf  []byte
 }
@@ -106,6 +107,27 @@ func NewSession(options ...Option) (*Session, error) {
 	// TODO: consider setting a finalizer with .Close
 
 	return &s, nil
+}
+
+// GetSession creates a Session object from an existing event tracing session instance.
+// Process will later fail if the session does not exist
+func GetSession(name string) (*Session, error) {
+	defaultConfig := SessionOptions{
+		Name: name,
+	}
+
+	session := Session{
+		config: defaultConfig,
+	}
+
+	utf16Name, err := windows.UTF16FromString(name)
+	if err != nil {
+		return nil, fmt.Errorf("incorrect session name; %w", err)
+	}
+	session.etwSessionName = utf16Name
+	session.propertiesBuf = session.getNewPropertiesBuffer()
+
+	return &session, nil
 }
 
 // Add or update a provider to the trace session
@@ -158,9 +180,18 @@ func (s *Session) Close() error {
 		}
 	}
 
-	if err := s.stopSession(); err != nil {
-		return fmt.Errorf("failed to stop session; %w", err)
+	if s.hRegistration > 0 {
+		if err := s.stopSession(); err != nil {
+			result = fmt.Errorf("failed to stop session; %w", err)
+		}
 	}
+
+	if s.hSession > 0 {
+		if err := s.closeTrace(); err != nil {
+			result = fmt.Errorf("failed to close trace; %w", err)
+		}
+	}
+
 	return result
 }
 
@@ -214,8 +245,7 @@ func KillSession(name string) error {
 	}
 }
 
-// createETWSession wraps StartTraceW.
-func (s *Session) createETWSession() error {
+func (s *Session) getNewPropertiesBuffer() []byte {
 	// We need to allocate a sequential buffer for a structure and a session name
 	// which will be placed there by an API call (for the future calls).
 	//
@@ -239,10 +269,17 @@ func (s *Session) createETWSession() error {
 	// Mark that we are going to process events in real time using a callback.
 	pProperties.LogFileMode = C.EVENT_TRACE_REAL_TIME_MODE
 
+	return propertiesBuf
+}
+
+// createETWSession wraps StartTraceW.
+func (s *Session) createETWSession() error {
+	propertiesBuf := s.getNewPropertiesBuffer()
+
 	ret := C.StartTraceW(
-		&s.hSession,
+		&s.hRegistration,
 		C.LPWSTR(unsafe.Pointer(&s.etwSessionName[0])),
-		pProperties,
+		(C.PEVENT_TRACE_PROPERTIES)(unsafe.Pointer(&propertiesBuf[0])),
 	)
 	switch err := windows.Errno(ret); err {
 	case windows.ERROR_ALREADY_EXISTS:
@@ -278,7 +315,7 @@ func (s *Session) subscribeToProvider(provider *Provider) error {
 	//
 	// Ref: https://docs.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-enabletraceex2
 	ret := C.EnableTraceEx2(
-		s.hSession,
+		s.hRegistration,
 		(*C.GUID)(unsafe.Pointer(&provider.ProviderId)),
 		C.EVENT_CONTROL_CODE_ENABLE_PROVIDER,
 		C.UCHAR(provider.Level),
@@ -308,7 +345,7 @@ func (s *Session) unsubscribeFromProvider(provider *Provider) error {
 	//	PENABLE_TRACE_PARAMETERS EnableParameters
 	// );
 	ret := C.EnableTraceEx2(
-		s.hSession,
+		s.hRegistration,
 		(*C.GUID)(unsafe.Pointer(&provider.ProviderId)),
 		C.EVENT_CONTROL_CODE_DISABLE_PROVIDER,
 		0,
@@ -334,6 +371,7 @@ func (s *Session) processEvents(callbackContextKey uintptr) error {
 	if C.INVALID_PROCESSTRACE_HANDLE == traceHandle {
 		return fmt.Errorf("OpenTraceW failed; %w", windows.GetLastError())
 	}
+	s.hSession = traceHandle
 
 	// BLOCKS UNTIL CLOSED!
 	//
@@ -358,6 +396,19 @@ func (s *Session) processEvents(callbackContextKey uintptr) error {
 	}
 }
 
+func (s *Session) closeTrace() error {
+	// ETW_APP_DECLSPEC_DEPRECATED ULONG WMIAPI CloseTrace(
+	//	[in] TRACEHANDLE TraceHandle
+	// );
+	ret := C.CloseTrace(s.hSession)
+	switch status := windows.Errno(ret); status {
+	case windows.ERROR_SUCCESS, windows.ERROR_CTX_CLOSE_PENDING:
+		return nil
+	default:
+		return fmt.Errorf("CloseTrace failed: %w", status)
+	}
+}
+
 // stopSession wraps ControlTraceW with EVENT_TRACE_CONTROL_STOP.
 func (s *Session) stopSession() error {
 	// ULONG WMIAPI ControlTraceW(
@@ -367,7 +418,7 @@ func (s *Session) stopSession() error {
 	//  ULONG                   ControlCode
 	// );
 	ret := C.ControlTraceW(
-		s.hSession,
+		s.hRegistration,
 		nil,
 		(C.PEVENT_TRACE_PROPERTIES)(unsafe.Pointer(&s.propertiesBuf[0])),
 		C.EVENT_TRACE_CONTROL_STOP)

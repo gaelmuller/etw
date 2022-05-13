@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os/exec"
 	"testing"
 	"time"
 
@@ -327,6 +328,45 @@ func (s *sessionSuite) TestMultipleProviers() {
 		"Failed to receive event from the second provider")
 
 	// Stop the session and ensure that processing goroutine will also stop.
+	s.Require().NoError(session.Close(), "Failed to close session properly")
+	s.waitForSignal(done, deadline, "Failed to stop event processing")
+}
+
+// Make sure we can subscribe to an existing session
+func (s *sessionSuite) TestGetSession() {
+	const deadline = 5 * time.Second
+
+	// Callback will signal about seen event
+	var gotEvent = make(chan struct{}, 1)
+	cb := func(e *etw.Event) {
+		s.trySignal(gotEvent)
+	}
+
+	// Try to process Security Events
+	done := make(chan struct{})
+	session, err := etw.GetSession("Eventlog-Security")
+	go func() {
+		s.Require().NoError(err, "Error creating session object")
+		s.Require().NoError(session.Process(cb), "Error processing events")
+		close(done)
+	}()
+
+	// Execute windows command that will generate events
+	go func() {
+		for {
+			select {
+			case <-s.ctx.Done():
+				return
+			default:
+				exec.Command("net", "user", "gael").Run()
+			}
+		}
+	}()
+
+	// Ensure that we are getting events
+	s.waitForSignal(gotEvent, deadline, "Failed to get event from Security Auditing")
+
+	// Stop the session and ensure that processing goroutine will also stop
 	s.Require().NoError(session.Close(), "Failed to close session properly")
 	s.waitForSignal(done, deadline, "Failed to stop event processing")
 }
