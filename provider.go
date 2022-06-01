@@ -14,6 +14,11 @@ type Provider struct {
 	// The provider ID (control GUID) of the event provider that you want to configure.
 	ProviderId windows.GUID
 
+	// KernelTrace Providers
+	EnableFlags uint64
+
+	// UserTrace Providers
+
 	// Level represents provider-defined value that specifies the level of
 	// detail included in the event. Higher levels imply that you get lower
 	// levels as well. For example, with TRACE_LEVEL_ERROR you'll get all
@@ -100,4 +105,8 @@ const (
 
 func NewProvider(id windows.GUID) *Provider {
 	return &Provider{ProviderId: id, Level: TRACE_LEVEL_VERBOSE}
+}
+
+func NewKernelProvider(id windows.GUID, flags uint64) *Provider {
+	return &Provider{ProviderId: id, EnableFlags: flags}
 }

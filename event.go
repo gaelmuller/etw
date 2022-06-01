@@ -1,9 +1,10 @@
-//+build windows
+//go:build windows
+// +build windows
 
 package etw
 
 /*
-	#include "session.h"
+	#include "etw.h"
 */
 import "C"
 import (

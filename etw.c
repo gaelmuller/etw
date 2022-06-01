@@ -1,4 +1,4 @@
-#include "session.h"
+#include "etw.h"
 #include <in6addr.h>
 
 // handleEvent is exported from Go to CGO. Unfortunately CGO can't vary calling

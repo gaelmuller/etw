@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"testing"
 	"time"
@@ -19,10 +20,10 @@ import (
 )
 
 func TestSession(t *testing.T) {
-	suite.Run(t, new(sessionSuite))
+	suite.Run(t, new(userTraceSuite))
 }
 
-type sessionSuite struct {
+type userTraceSuite struct {
 	suite.Suite
 
 	ctx      context.Context
@@ -31,7 +32,7 @@ type sessionSuite struct {
 	guid     windows.GUID
 }
 
-func (s *sessionSuite) SetupTest() {
+func (s *userTraceSuite) SetupTest() {
 	provider, err := msetw.NewProvider("TestProvider", nil)
 	s.Require().NoError(err, "Failed to initialize test provider.")
 
@@ -41,36 +42,36 @@ func (s *sessionSuite) SetupTest() {
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 }
 
-func (s *sessionSuite) TearDownTest() {
+func (s *userTraceSuite) TearDownTest() {
 	s.cancel()
 	s.Require().NoError(s.provider.Close(), "Failed to close test provider.")
 }
 
-// TestSmoke ensures that etw.Session is working as expected: it could start, process incoming
+// TestSmoke ensures that etw.UserTrace is working as expected: it could start, process incoming
 // events and stop properly.
-func (s *sessionSuite) TestSmoke() {
+func (s *userTraceSuite) TestSmoke() {
 	const deadline = 10 * time.Second
 
 	// Spam some events to emulate a normal ETW provider behaviour.
 	go s.generateEvents(s.ctx, s.provider, []msetw.Level{msetw.LevelInfo})
 
-	// Ensure we can subscribe to our in-house ETW provider.
-	session, err := etw.NewSession()
-	s.Require().NoError(err, "Failed to create session")
-
-	err = session.AddOrUpdateProvider(etw.NewProvider(s.guid))
-	s.Require().NoError(err, "Failed to add provider")
-
 	// The only thing we are going to do is signal that we've got something.
 	gotEvent := make(chan struct{})
+	defer close(gotEvent)
 	cb := func(_ *etw.Event) {
-		s.trySignal(gotEvent)
+		trySignal(gotEvent)
 	}
 
-	// Start the processing routine. We expect the routine will stop on `session.Close()`.
+	// Ensure we can subscribe to our in-house ETW provider.
+	trace, err := etw.NewUserTrace("Test-ETW", cb)
+	s.Require().NoError(err, "Failed to create trace")
+
+	trace.Enable(etw.NewProvider(s.guid))
+
+	// Start the processing routine. We expect the routine will stop on `trace.Stop()`.
 	done := make(chan struct{})
 	go func() {
-		s.Require().NoError(session.Process(cb), "Error processing events")
+		s.Require().NoError(trace.Start(), "Error processing events")
 		close(done)
 	}()
 
@@ -79,70 +80,12 @@ func (s *sessionSuite) TestSmoke() {
 	s.waitForSignal(gotEvent, deadline, "Failed to receive event from provider")
 
 	// Now stop the session and ensure that processing goroutine will also stop.
-	s.Require().NoError(session.Close(), "Failed to close session properly")
+	s.Require().NoError(trace.Stop(), "Failed to close session properly")
 	s.waitForSignal(done, deadline, "Failed to stop event processing")
 }
 
-// TestUpdating ensures that etw.Session is able to update its properties in runtime.
-func (s *sessionSuite) TestUpdating() {
-	const deadline = 10 * time.Second
-
-	// Create a provider that will spam both INFO and CRITICAL events.
-	go s.generateEvents(s.ctx, s.provider, []msetw.Level{msetw.LevelInfo, msetw.LevelCritical})
-
-	// Then subscribe for CRITICAL only.
-	session, err := etw.NewSession()
-	s.Require().NoError(err, "Failed to create session")
-
-	provider := etw.NewProvider(s.guid)
-	provider.Level = etw.TRACE_LEVEL_CRITICAL
-	err = session.AddOrUpdateProvider(provider)
-	s.Require().NoError(err, "Failed to add provider")
-
-	// Callback will signal about seen event level through corresponding channels.
-	var (
-		gotCriticalEvent    = make(chan struct{}, 1)
-		gotInformationEvent = make(chan struct{}, 1)
-	)
-	cb := func(e *etw.Event) {
-		switch etw.TraceLevel(e.Header.Level) {
-		case etw.TRACE_LEVEL_INFORMATION:
-			s.trySignal(gotInformationEvent)
-		case etw.TRACE_LEVEL_CRITICAL:
-			s.trySignal(gotCriticalEvent)
-		}
-	}
-	done := make(chan struct{})
-	go func() {
-		s.Require().NoError(session.Process(cb), "Error processing events")
-		close(done)
-	}()
-
-	// Ensure that we are getting INFO events but NO CRITICAL ones.
-	s.waitForSignal(gotCriticalEvent, deadline, "Failed to get event with CRITICAL level")
-	select {
-	case <-time.After(deadline): // pass
-	case <-gotInformationEvent:
-		s.Fail("Received event with unexpected level")
-	}
-
-	// Now bump the subscription option with new event level.
-	// (We could actually update any updatable option, level is just the most obvious.)
-	provider.Level = etw.TRACE_LEVEL_INFORMATION
-	err = session.AddOrUpdateProvider(provider)
-	s.Require().NoError(err, "Failed to update provider")
-
-	// If the provider update was successfully applied we should catch event with INFO level too.
-	s.waitForSignal(gotInformationEvent, deadline,
-		"Failed to receive event with INFO level after updating session options")
-
-	// Stop the session and ensure that processing goroutine will also stop.
-	s.Require().NoError(session.Close(), "Failed to close session properly")
-	s.waitForSignal(done, deadline, "Failed to stop event processing")
-}
-
-// TestParsing ensures that etw.Session is able to parse events with all common field types.
-func (s *sessionSuite) TestParsing() {
+// TestParsing ensures that etw.Trace is able to parse events with all common field types.
+func (s *userTraceSuite) TestParsing() {
 	const deadline = 20 * time.Second
 
 	go s.generateEvents(
@@ -178,71 +121,39 @@ func (s *sessionSuite) TestParsing() {
 		"anotherArray":       []interface{}{"3", "4"},
 	}
 
-	session, err := etw.NewSession()
-	s.Require().NoError(err, "Failed to create a session")
-
-	err = session.AddOrUpdateProvider(etw.NewProvider(s.guid))
-	s.Require().NoError(err, "Failed to add provider")
-
 	var (
 		properties map[string]interface{}
 		gotProps   = make(chan struct{}, 1)
+		err        error
 	)
 	cb := func(e *etw.Event) {
 		properties, err = e.EventProperties()
 		s.Require().NoError(err, "Got error parsing event properties")
-		s.trySignal(gotProps)
+		trySignal(gotProps)
 	}
+
+	trace, err := etw.NewUserTrace("Test-ETW", cb)
+	s.Require().NoError(err, "Failed to create a trace")
+
+	trace.Enable(etw.NewProvider(s.guid))
 
 	done := make(chan struct{})
 	go func() {
-		s.Require().NoError(session.Process(cb), "Error processing events")
+		s.Require().NoError(trace.Start(), "Error processing events")
 		close(done)
 	}()
 
 	s.waitForSignal(gotProps, deadline, "Failed to get event")
 	s.Equal(expectedMap, properties, "Received unexpected properties")
 
-	s.Require().NoError(session.Close(), "Failed to close session properly")
+	s.Require().NoError(trace.Stop(), "Failed to close session properly")
 	s.waitForSignal(done, deadline, "Failed to stop event processing")
 }
 
-// TestKillSession ensures that we are able to force kill the lost session using only
-// its name.
-func (s *sessionSuite) TestKillSession() {
-	sessionName := fmt.Sprintf("go-etw-suicide-%d", time.Now().UnixNano())
-
-	// Ensure we can create a session with a given name.
-	_, err := etw.NewSession(etw.WithName(sessionName))
-	s.Require().NoError(err, "Failed to create session with name %s", sessionName)
-
-	// Ensure we've got ExistsError creating a session with the same name.
-	_, err = etw.NewSession(etw.WithName(sessionName))
-	s.Require().Error(err)
-
-	var exists etw.ExistsError
-	s.Require().True(errors.As(err, &exists), "Got unexpected error starting session with a same name")
-	s.Equal(exists.SessionName, sessionName, "Got unexpected name in etw.ExistsError")
-
-	// Try to force-kill the session by name.
-	s.Require().NoError(etw.KillSession(sessionName), "Failed to force stop session")
-
-	// Ensure that fresh session could normally started and stopped.
-	session, err := etw.NewSession(etw.WithName(sessionName))
-	s.Require().NoError(err, "Failed to create session after a successful kill")
-	s.Require().NoError(session.Close(), "Failed to close session properly")
-}
-
 // TestEventOutsideCallback ensures *etw.Event can't be used outside EventCallback.
-func (s *sessionSuite) TestEventOutsideCallback() {
+func (s *userTraceSuite) TestEventOutsideCallback() {
 	const deadline = 10 * time.Second
 	go s.generateEvents(s.ctx, s.provider, []msetw.Level{msetw.LevelInfo})
-
-	session, err := etw.NewSession()
-	s.Require().NoError(err, "Failed to create session")
-
-	err = session.AddOrUpdateProvider(etw.NewProvider(s.guid))
-	s.Require().NoError(err, "Failed to add provider")
 
 	// Grab event pointer from the callback. We expect that outdated pointer
 	// will protect user from calling Windows API on freed memory.
@@ -251,14 +162,20 @@ func (s *sessionSuite) TestEventOutsideCallback() {
 	cb := func(e *etw.Event) {
 		// Signal on second event only to guarantee that callback with stored event will finish.
 		if evt != nil {
-			s.trySignal(gotEvent)
+			trySignal(gotEvent)
 		} else {
 			evt = e
 		}
 	}
+
+	trace, err := etw.NewUserTrace("Test-ETW", cb)
+	s.Require().NoError(err, "Failed to create session")
+
+	trace.Enable(etw.NewProvider(s.guid))
+
 	done := make(chan struct{})
 	go func() {
-		s.Require().NoError(session.Process(cb), "Error processing events")
+		s.Require().NoError(trace.Start(), "Error processing events")
 		close(done)
 	}()
 
@@ -269,12 +186,12 @@ func (s *sessionSuite) TestEventOutsideCallback() {
 	s.Assert().Error(err, "Don't get an error using freed event")
 	s.Assert().Contains(err.Error(), "EventCallback", "Got unexpected error: %s", err)
 
-	s.Require().NoError(session.Close(), "Failed to close session properly")
+	s.Require().NoError(trace.Stop(), "Failed to close session properly")
 	s.waitForSignal(done, deadline, "Failed to stop event processing")
 }
 
 // TestMultipleProviders ensures we can subscribe to several providers in the same trace session
-func (s *sessionSuite) TestMultipleProviers() {
+func (s *userTraceSuite) TestMultipleProviers() {
 	const deadline = 2 * time.Second
 
 	// Create a provider that will spam INFO events.
@@ -285,13 +202,6 @@ func (s *sessionSuite) TestMultipleProviers() {
 	s.Require().NoError(err, "Failed to initialize test provider.")
 	go s.generateEvents(s.ctx, secondProvider, []msetw.Level{msetw.LevelCritical})
 
-	// Then subscribe to the first producer
-	session, err := etw.NewSession()
-	s.Require().NoError(err, "Failed to create session")
-
-	err = session.AddOrUpdateProvider(etw.NewProvider(s.guid))
-	s.Require().NoError(err, "Failed to add provider")
-
 	// Callback will signal about seen event level through corresponding channels.
 	var (
 		gotCriticalEvent    = make(chan struct{}, 1)
@@ -300,54 +210,53 @@ func (s *sessionSuite) TestMultipleProviers() {
 	cb := func(e *etw.Event) {
 		switch etw.TraceLevel(e.Header.Level) {
 		case etw.TRACE_LEVEL_INFORMATION:
-			s.trySignal(gotInformationEvent)
+			trySignal(gotInformationEvent)
 		case etw.TRACE_LEVEL_CRITICAL:
-			s.trySignal(gotCriticalEvent)
+			trySignal(gotCriticalEvent)
 		}
 	}
+
+	// Then subscribe to the both producers
+	trace, err := etw.NewUserTrace("Test-ETW", cb)
+	s.Require().NoError(err, "Failed to create session")
+
+	trace.Enable(etw.NewProvider(s.guid))
+	trace.Enable(etw.NewProvider(windows.GUID(secondProvider.ID)))
+
 	done := make(chan struct{})
 	go func() {
-		s.Require().NoError(session.Process(cb), "Error processing events")
+		s.Require().NoError(trace.Start(), "Error processing events")
 		close(done)
 	}()
 
-	// Ensure that we are getting INFO events but NO CRITICAL ones.
+	// Ensure that we are getting INFO and CRITICAL events
 	s.waitForSignal(gotInformationEvent, deadline, "Failed to get event from the first provider")
-	select {
-	case <-time.After(deadline): // pass
-	case <-gotCriticalEvent:
-		s.Fail("Received event from unexpected producer")
-	}
-
-	// Add subscription to the second producer
-	err = session.AddOrUpdateProvider(etw.NewProvider(windows.GUID(secondProvider.ID)))
-	s.Require().NoError(err, "Failed to add second provider")
-
-	// If the provider update was successfully applied we should catch event with CRITICAL level too.
 	s.waitForSignal(gotCriticalEvent, deadline,
 		"Failed to receive event from the second provider")
 
 	// Stop the session and ensure that processing goroutine will also stop.
-	s.Require().NoError(session.Close(), "Failed to close session properly")
+	s.Require().NoError(trace.Stop(), "Failed to close session properly")
 	s.waitForSignal(done, deadline, "Failed to stop event processing")
 }
 
-// Make sure we can subscribe to an existing session
-func (s *sessionSuite) TestGetSession() {
+func (s *userTraceSuite) TestGetSession() {
 	const deadline = 5 * time.Second
 
 	// Callback will signal about seen event
 	var gotEvent = make(chan struct{}, 1)
 	cb := func(e *etw.Event) {
-		s.trySignal(gotEvent)
+		trySignal(gotEvent)
 	}
 
 	// Try to process Security Events
 	done := make(chan struct{})
-	session, err := etw.GetSession("Eventlog-Security")
+	trace, err := etw.NewUserTrace("Eventlog-Security", cb)
+	s.Require().NoError(err, "Error creating trace object")
+
+	s.Require().NoError(trace.OpenTrace(), "Error opening the trace")
+
 	go func() {
-		s.Require().NoError(err, "Error creating session object")
-		s.Require().NoError(session.Process(cb), "Error processing events")
+		s.Require().NoError(trace.Process(), "Error processing events")
 		close(done)
 	}()
 
@@ -358,7 +267,7 @@ func (s *sessionSuite) TestGetSession() {
 			case <-s.ctx.Done():
 				return
 			default:
-				exec.Command("net", "user", "gael").Run()
+				exec.Command("net", "user", os.ExpandEnv("Username")).Run()
 			}
 		}
 	}()
@@ -367,13 +276,38 @@ func (s *sessionSuite) TestGetSession() {
 	s.waitForSignal(gotEvent, deadline, "Failed to get event from Security Auditing")
 
 	// Stop the session and ensure that processing goroutine will also stop
-	s.Require().NoError(session.Close(), "Failed to close session properly")
+	s.Require().NoError(trace.Stop(), "Failed to close session properly")
 	s.waitForSignal(done, deadline, "Failed to stop event processing")
+}
+
+// TestStopExisting ensures that we are able to force kill the lost session using only
+// its name.
+func (s *userTraceSuite) TestStopExisting() {
+	sessionName := fmt.Sprintf("go-etw-suicide-%d", time.Now().UnixNano())
+
+	// Ensure we can create a session with a given name.
+	trace, _ := etw.NewUserTrace(sessionName, nil)
+	s.Require().NoError(trace.Open(), "Failed to create session with name %s", sessionName)
+
+	// Ensure we've got ExistsError creating a session with the same name.
+	trace, _ = etw.NewUserTrace(sessionName, nil)
+	err := trace.Open()
+	s.Require().Error(err)
+
+	var exists etw.ExistsError
+	s.Require().True(errors.As(err, &exists), "Got unexpected error starting session with a same name")
+
+	// Try to force-kill the session by name.
+	s.Require().NoError(trace.Kill(), "Failed to force stop session")
+
+	// Ensure that fresh session could normally started and stopped.
+	s.Require().NoError(trace.Open(), "Failed to create session after a successful kill")
+	s.Require().NoError(trace.Stop(), "Failed to close session properly")
 }
 
 // trySignal tries to send a signal to @done if it's ready to receive.
 // @done expected to be a buffered channel.
-func (s sessionSuite) trySignal(done chan<- struct{}) {
+func trySignal(done chan<- struct{}) {
 	select {
 	case done <- struct{}{}:
 	default:
@@ -382,7 +316,7 @@ func (s sessionSuite) trySignal(done chan<- struct{}) {
 
 // waitForSignal waits for anything on @done no longer than @deadline.
 // Fails test run if deadline exceeds.
-func (s sessionSuite) waitForSignal(done <-chan struct{}, deadline time.Duration, failMsg string) {
+func (s userTraceSuite) waitForSignal(done <-chan struct{}, deadline time.Duration, failMsg string) {
 	select {
 	case <-done:
 		// pass.
@@ -394,7 +328,7 @@ func (s sessionSuite) waitForSignal(done <-chan struct{}, deadline time.Duration
 // We have no easy way to ensure that etw session is started and ready to process events,
 // so it seems easier to just flood an events and catch some of them than try to catch
 // the actual session readiness and sent the only one.
-func (s sessionSuite) generateEvents(ctx context.Context, provider *msetw.Provider, levels []msetw.Level, fields ...msetw.FieldOpt) {
+func (s userTraceSuite) generateEvents(ctx context.Context, provider *msetw.Provider, levels []msetw.Level, fields ...msetw.FieldOpt) {
 	// If nothing provided, receiver doesn't care about the event content -- send anything.
 	if fields == nil {
 		fields = msetw.WithFields(msetw.StringField("TestField", "Foo"))

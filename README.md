@@ -19,4 +19,4 @@ Go compiler (take a look at [build/vars.sh](./build/vars.sh) and [examples/trace
 
 Package reference is available at https://pkg.go.dev/github.com/gaelmuller/etw
 
-You can look at `session_test.go` to see examples.
+You can look at `user_trace_test.go` and `kernel_trace_test.go` to see examples.
