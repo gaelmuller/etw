@@ -1,7 +1,7 @@
 //go:build windows
 // +build windows
 
-package etw_test
+package etw
 
 import (
 	"context"
@@ -11,8 +11,6 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/suite"
-
-	"github.com/gaelmuller/etw"
 )
 
 func TestKernelTrace(t *testing.T) {
@@ -42,7 +40,7 @@ func (s *kernelTraceSuite) TestCollectKernelEvents() {
 	var collectedEvents = make(chan map[string]interface{}, 10000)
 	defer close(collectedEvents)
 
-	cb := func(e *etw.Event) {
+	cb := func(e *Event) {
 		properties, err := e.EventProperties()
 		s.Require().NoError(err, "Got error parsing event properties")
 		collectedEvents <- properties
@@ -50,10 +48,10 @@ func (s *kernelTraceSuite) TestCollectKernelEvents() {
 
 	// Try to process kernel process events
 	done := make(chan struct{})
-	trace, err := etw.NewKernelTrace("Test-ETW", cb)
+	trace, err := NewKernelTrace("Test-ETW", cb)
 	s.Require().NoError(err, "Error creating trace object")
 
-	trace.Enable(etw.KERNEL_PROCESS_PROVIDER)
+	trace.Enable(KERNEL_PROCESS_PROVIDER)
 
 	go func() {
 		s.Require().NoError(trace.Start(), "Error processing events")

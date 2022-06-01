@@ -1,7 +1,7 @@
 //go:build windows
 // +build windows
 
-package etw_test
+package etw
 
 import (
 	"context"
@@ -15,11 +15,9 @@ import (
 	msetw "github.com/Microsoft/go-winio/pkg/etw"
 	"github.com/stretchr/testify/suite"
 	"golang.org/x/sys/windows"
-
-	"github.com/gaelmuller/etw"
 )
 
-func TestSession(t *testing.T) {
+func TestUserTrace(t *testing.T) {
 	suite.Run(t, new(userTraceSuite))
 }
 
@@ -58,15 +56,15 @@ func (s *userTraceSuite) TestSmoke() {
 	// The only thing we are going to do is signal that we've got something.
 	gotEvent := make(chan struct{})
 	defer close(gotEvent)
-	cb := func(_ *etw.Event) {
+	cb := func(_ *Event) {
 		trySignal(gotEvent)
 	}
 
 	// Ensure we can subscribe to our in-house ETW provider.
-	trace, err := etw.NewUserTrace("Test-ETW", cb)
+	trace, err := NewUserTrace("Test-ETW", cb)
 	s.Require().NoError(err, "Failed to create trace")
 
-	trace.Enable(etw.NewProvider(s.guid))
+	trace.Enable(NewProvider(s.guid))
 
 	// Start the processing routine. We expect the routine will stop on `trace.Stop()`.
 	done := make(chan struct{})
@@ -126,16 +124,16 @@ func (s *userTraceSuite) TestParsing() {
 		gotProps   = make(chan struct{}, 1)
 		err        error
 	)
-	cb := func(e *etw.Event) {
+	cb := func(e *Event) {
 		properties, err = e.EventProperties()
 		s.Require().NoError(err, "Got error parsing event properties")
 		trySignal(gotProps)
 	}
 
-	trace, err := etw.NewUserTrace("Test-ETW", cb)
+	trace, err := NewUserTrace("Test-ETW", cb)
 	s.Require().NoError(err, "Failed to create a trace")
 
-	trace.Enable(etw.NewProvider(s.guid))
+	trace.Enable(NewProvider(s.guid))
 
 	done := make(chan struct{})
 	go func() {
@@ -150,16 +148,16 @@ func (s *userTraceSuite) TestParsing() {
 	s.waitForSignal(done, deadline, "Failed to stop event processing")
 }
 
-// TestEventOutsideCallback ensures *etw.Event can't be used outside EventCallback.
+// TestEventOutsideCallback ensures *Event can't be used outside EventCallback.
 func (s *userTraceSuite) TestEventOutsideCallback() {
 	const deadline = 10 * time.Second
 	go s.generateEvents(s.ctx, s.provider, []msetw.Level{msetw.LevelInfo})
 
 	// Grab event pointer from the callback. We expect that outdated pointer
 	// will protect user from calling Windows API on freed memory.
-	var evt *etw.Event
+	var evt *Event
 	gotEvent := make(chan struct{})
-	cb := func(e *etw.Event) {
+	cb := func(e *Event) {
 		// Signal on second event only to guarantee that callback with stored event will finish.
 		if evt != nil {
 			trySignal(gotEvent)
@@ -168,10 +166,10 @@ func (s *userTraceSuite) TestEventOutsideCallback() {
 		}
 	}
 
-	trace, err := etw.NewUserTrace("Test-ETW", cb)
+	trace, err := NewUserTrace("Test-ETW", cb)
 	s.Require().NoError(err, "Failed to create session")
 
-	trace.Enable(etw.NewProvider(s.guid))
+	trace.Enable(NewProvider(s.guid))
 
 	done := make(chan struct{})
 	go func() {
@@ -207,21 +205,21 @@ func (s *userTraceSuite) TestMultipleProviers() {
 		gotCriticalEvent    = make(chan struct{}, 1)
 		gotInformationEvent = make(chan struct{}, 1)
 	)
-	cb := func(e *etw.Event) {
-		switch etw.TraceLevel(e.Header.Level) {
-		case etw.TRACE_LEVEL_INFORMATION:
+	cb := func(e *Event) {
+		switch TraceLevel(e.Header.Level) {
+		case TRACE_LEVEL_INFORMATION:
 			trySignal(gotInformationEvent)
-		case etw.TRACE_LEVEL_CRITICAL:
+		case TRACE_LEVEL_CRITICAL:
 			trySignal(gotCriticalEvent)
 		}
 	}
 
 	// Then subscribe to the both producers
-	trace, err := etw.NewUserTrace("Test-ETW", cb)
+	trace, err := NewUserTrace("Test-ETW", cb)
 	s.Require().NoError(err, "Failed to create session")
 
-	trace.Enable(etw.NewProvider(s.guid))
-	trace.Enable(etw.NewProvider(windows.GUID(secondProvider.ID)))
+	trace.Enable(NewProvider(s.guid))
+	trace.Enable(NewProvider(windows.GUID(secondProvider.ID)))
 
 	done := make(chan struct{})
 	go func() {
@@ -239,18 +237,18 @@ func (s *userTraceSuite) TestMultipleProviers() {
 	s.waitForSignal(done, deadline, "Failed to stop event processing")
 }
 
-func (s *userTraceSuite) TestGetSession() {
+func (s *userTraceSuite) TestExistingTrace() {
 	const deadline = 5 * time.Second
 
 	// Callback will signal about seen event
 	var gotEvent = make(chan struct{}, 1)
-	cb := func(e *etw.Event) {
+	cb := func(e *Event) {
 		trySignal(gotEvent)
 	}
 
 	// Try to process Security Events
 	done := make(chan struct{})
-	trace, err := etw.NewUserTrace("Eventlog-Security", cb)
+	trace, err := NewUserTrace("Eventlog-Security", cb)
 	s.Require().NoError(err, "Error creating trace object")
 
 	s.Require().NoError(trace.OpenTrace(), "Error opening the trace")
@@ -286,15 +284,15 @@ func (s *userTraceSuite) TestStopExisting() {
 	sessionName := fmt.Sprintf("go-etw-suicide-%d", time.Now().UnixNano())
 
 	// Ensure we can create a session with a given name.
-	trace, _ := etw.NewUserTrace(sessionName, nil)
+	trace, _ := NewUserTrace(sessionName, nil)
 	s.Require().NoError(trace.Open(), "Failed to create session with name %s", sessionName)
 
 	// Ensure we've got ExistsError creating a session with the same name.
-	trace, _ = etw.NewUserTrace(sessionName, nil)
+	trace, _ = NewUserTrace(sessionName, nil)
 	err := trace.Open()
 	s.Require().Error(err)
 
-	var exists etw.ExistsError
+	var exists ExistsError
 	s.Require().True(errors.As(err, &exists), "Got unexpected error starting session with a same name")
 
 	// Try to force-kill the session by name.
