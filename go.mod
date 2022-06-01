@@ -1,4 +1,4 @@
-module github.com/gaelmuller/etw
+module github.com/gaelmuller/etw/v2
 
 go 1.13
 
